@@ -1,0 +1,150 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2026-11-10T12:00:00Z",
+  "default_currency": "USD",
+  "char_to_token_ratio": 4.0,
+  "default_budget_limit_usd": 0.50,
+  "default_max_turns": 30,
+  "tiers": {
+    "TIER_0_CACHE": {
+      "name": "Semantic Cache",
+      "target_latency_ms": 1.0,
+      "cost_multiplier": 0.0,
+      "models": ["cache", "semantic-cache"]
+    },
+    "TIER_1_FAST": {
+      "name": "System-One Fast Path / SLM",
+      "target_latency_ms": 15.0,
+      "cost_multiplier": 0.05,
+      "models": [
+        "gemini-2.0-flash-lite",
+        "gpt-4o-mini",
+        "claude-3-5-haiku-20241022",
+        "claude-3-5-haiku",
+        "local-slm"
+      ]
+    },
+    "TIER_2_BALANCED": {
+      "name": "System-Two Balanced Workhorse",
+      "target_latency_ms": 500.0,
+      "cost_multiplier": 1.0,
+      "models": [
+        "gemini-2.0-flash",
+        "gpt-4o",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-sonnet"
+      ]
+    },
+    "TIER_3_REASONING": {
+      "name": "Frontier Deep Reasoning",
+      "target_latency_ms": 3000.0,
+      "cost_multiplier": 5.0,
+      "models": [
+        "o3-mini",
+        "o1",
+        "claude-3-opus-20240229",
+        "claude-3-opus",
+        "gemini-1.5-pro",
+        "gemini-2.0-pro"
+      ]
+    }
+  },
+  "models": {
+    "cache": {
+      "provider": "local",
+      "tier": "TIER_0_CACHE",
+      "prompt_per_1m": 0.0,
+      "completion_per_1m": 0.0
+    },
+    "local-slm": {
+      "provider": "local",
+      "tier": "TIER_1_FAST",
+      "prompt_per_1m": 0.0,
+      "completion_per_1m": 0.0
+    },
+    "gpt-4o": {
+      "provider": "openai",
+      "tier": "TIER_2_BALANCED",
+      "prompt_per_1m": 2.50,
+      "completion_per_1m": 10.00
+    },
+    "gpt-4o-mini": {
+      "provider": "openai",
+      "tier": "TIER_1_FAST",
+      "prompt_per_1m": 0.15,
+      "completion_per_1m": 0.60
+    },
+    "o3-mini": {
+      "provider": "openai",
+      "tier": "TIER_3_REASONING",
+      "prompt_per_1m": 1.10,
+      "completion_per_1m": 4.40
+    },
+    "o1": {
+      "provider": "openai",
+      "tier": "TIER_3_REASONING",
+      "prompt_per_1m": 15.00,
+      "completion_per_1m": 60.00
+    },
+    "claude-3-5-sonnet": {
+      "provider": "anthropic",
+      "tier": "TIER_2_BALANCED",
+      "prompt_per_1m": 3.00,
+      "completion_per_1m": 15.00
+    },
+    "claude-3-5-sonnet-20241022": {
+      "provider": "anthropic",
+      "tier": "TIER_2_BALANCED",
+      "prompt_per_1m": 3.00,
+      "completion_per_1m": 15.00
+    },
+    "claude-3-5-haiku": {
+      "provider": "anthropic",
+      "tier": "TIER_1_FAST",
+      "prompt_per_1m": 0.80,
+      "completion_per_1m": 4.00
+    },
+    "claude-3-5-haiku-20241022": {
+      "provider": "anthropic",
+      "tier": "TIER_1_FAST",
+      "prompt_per_1m": 0.80,
+      "completion_per_1m": 4.00
+    },
+    "claude-3-opus": {
+      "provider": "anthropic",
+      "tier": "TIER_3_REASONING",
+      "prompt_per_1m": 15.00,
+      "completion_per_1m": 75.00
+    },
+    "claude-3-opus-20240229": {
+      "provider": "anthropic",
+      "tier": "TIER_3_REASONING",
+      "prompt_per_1m": 15.00,
+      "completion_per_1m": 75.00
+    },
+    "gemini-2.0-flash": {
+      "provider": "google",
+      "tier": "TIER_2_BALANCED",
+      "prompt_per_1m": 0.10,
+      "completion_per_1m": 0.40
+    },
+    "gemini-2.0-flash-lite": {
+      "provider": "google",
+      "tier": "TIER_1_FAST",
+      "prompt_per_1m": 0.075,
+      "completion_per_1m": 0.30
+    },
+    "gemini-1.5-pro": {
+      "provider": "google",
+      "tier": "TIER_3_REASONING",
+      "prompt_per_1m": 1.25,
+      "completion_per_1m": 5.00
+    },
+    "gemini-2.0-pro": {
+      "provider": "google",
+      "tier": "TIER_3_REASONING",
+      "prompt_per_1m": 1.25,
+      "completion_per_1m": 5.00
+    }
+  }
+}

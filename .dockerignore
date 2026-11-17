@@ -1,0 +1,10 @@
+target/
+*.pyc
+__pycache__/
+.git/
+.DS_Store
+bridges/
+review_consensus_sentinel.py
+dist/
+dist_promoted/
+scratch/

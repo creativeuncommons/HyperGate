@@ -1,9 +1,10 @@
 # ⚡ HyperGate: System-One Intelligent Inference Router & Cost-Cascade Gateway
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Zero External Dependencies](https://img.shields.io/badge/dependencies-zero%20(stdlib%20only)-brightgreen.svg)](hypergate-py/)
-[![Latency Overhead](https://img.shields.io/badge/overhead-%3C%201.0%20ms-success.svg)](benchmarks/)
-[![Tri-Model Consensus](https://img.shields.io/badge/consensus-2--of--3%20majority-purple.svg)](review_consensus_sentinel.py)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Zero External Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(Pure%20Stdlib)-brightgreen.svg)](hypergate-py/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Latency Overhead](https://img.shields.io/badge/Overhead-%3C%201.0%20ms-success.svg)](benchmarks/)
+[![CI Build](https://github.com/creativeuncommons/HyperGate/actions/workflows/release.yml/badge.svg)](https://github.com/creativeuncommons/HyperGate/actions)
 
 **HyperGate** is an ultra-low-latency, zero-overhead intelligent inference router and circuit-breaker gateway designed to sit between autonomous AI agents, LLM providers, and local tools.
 

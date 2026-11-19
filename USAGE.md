@@ -185,7 +185,7 @@ docker run -d -p 8080:8080 creativeuncommons/hypergate:v0.1.0
 
 ## 7. Tri-Model Consensus Gate Execution (Incubator Only)
 
-The incubator includes an automated 2-of-3 majority gate across Claude Opus 5.5, Codex Astra, and Gemini 4 Argon:
+The incubator includes an automated 2-of-3 majority gate across Claude Opus 5.5, Codex Astra, and Gemini 4 Neon:
 
 ```bash
 # Audit a code implementation or PR diff

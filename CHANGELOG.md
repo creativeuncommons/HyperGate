@@ -59,5 +59,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Sub-millisecond added routing overhead ($< 1.0\text{ ms}$).
   - Multi-stage Docker containerization for minimal RSS footprints.
 - **Incubator Tri-Model Consensus Gate**:
-  - Automated 2-of-3 majority peer-review gate spanning Claude Opus 5.5, Codex Astra, and Gemini 4 Argon.
+  - Automated 2-of-3 majority peer-review gate spanning Claude Opus 5.5, Codex Astra, and Gemini 4 Neon.
   - One-click promotion pipeline (`scripts/promote_to_standalone.py`) ensuring clean separation of incubator governance from standalone production release.

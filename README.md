@@ -227,7 +227,7 @@ Every proxied and synthetic response includes:
 During monorepo incubation, all architectural changes and specifications are peer-reviewed by an automated 2-of-3 majority panel:
 - **Claude Opus 5.5**: Edge-case critique & cascade failure boundary analysis.
 - **Codex Astra**: Concurrency, memory alignment, and compiler correctness in Rust.
-- **Gemini 4 Argon**: Systems architect and Antigravity Lead Studio Builder.
+- **Gemini 4 Neon**: Systems architect and Antigravity Lead Studio Builder.
 
 Execute gate:
 ```bash

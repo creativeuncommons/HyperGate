@@ -183,30 +183,13 @@ docker run -d -p 8080:8080 creativeuncommons/hypergate:v0.1.0
 
 ---
 
-## 7. Tri-Model Consensus Gate Execution (Incubator Only)
+## 7. Quality Assurance & Test Suites
 
-The incubator includes an automated 2-of-3 majority gate across Claude Opus 5.5, Codex Astra, and Gemini 4 Neon:
-
-```bash
-# Audit a code implementation or PR diff
-python3 review_consensus_sentinel.py hypergate-py/hypergate.py --title "Python Gateway Core" --mode code
-
-# Audit technical documentation
-python3 review_consensus_sentinel.py USAGE.md --title "Usage Protocol Manual" --mode doc
-```
-
-Ballot reports are written to `scratch/consensus_reports/`.
-
----
-
-## 8. Standalone Promotion Pipeline
-
-To lift HyperGate from the monorepo incubator into a standalone open-source repository:
+Execute the comprehensive test suite verifying tool pruning, circuit breakers, and cost accounting:
 
 ```bash
-python3 scripts/promote_to_standalone.py \
-  --dest dist_promoted/HyperGate \
-  --remote git@github.com:creativeuncommons/HyperGate.git
+# Run test suite
+python3 -m unittest discover -s tests/
 ```
 This sanitizes incubator bridges, runs test suites, and initializes a clean Git repository with commit metadata and version tag `v0.1.0`.
 

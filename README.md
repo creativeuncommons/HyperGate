@@ -222,28 +222,13 @@ Every proxied and synthetic response includes:
 
 ---
 
-## 🤝 Tri-Model Consensus Gate (Incubator Only)
+## 🧪 Quality Assurance & Test Suites
 
-During monorepo incubation, all architectural changes and specifications are peer-reviewed by an automated 2-of-3 majority panel:
-- **Claude Opus 5.5**: Edge-case critique & cascade failure boundary analysis.
-- **Codex Astra**: Concurrency, memory alignment, and compiler correctness in Rust.
-- **Gemini 4 Neon**: Systems architect and Antigravity Lead Studio Builder.
-
-Execute gate:
-```bash
-python3 review_consensus_sentinel.py hypergate-py/hypergate.py --title "Python Gateway Core" --mode code
-```
-
----
-
-## 🚀 Standalone Promotion
-
-Promote the project from the monorepo incubator to a clean standalone repository:
+HyperGate includes comprehensive test suites covering tool pruning, cost accounting, and circuit breakers:
 
 ```bash
-python3 scripts/promote_to_standalone.py \
-  --dest dist_promoted/HyperGate \
-  --remote git@github.com:creativeuncommons/HyperGate.git
+# Run unit and regression tests
+python3 -m unittest discover -s tests/
 ```
 
 ---

@@ -12,6 +12,11 @@ import sys
 import json
 import time
 import uuid
+import queue
+import atexit
+import random
+import weakref
+import pathlib
 import sqlite3
 import datetime
 import urllib.request
@@ -24,11 +29,13 @@ import hmac
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, List, Optional, Tuple, Callable, Set
+from typing import Dict, Any, List, Optional, Tuple, Callable, Set, Protocol, runtime_checkable
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 _TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_GATEWAY_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
+ENV_SHARD_BY_PID = "HYPERGATE_SHARD_BY_PID"
+ENV_ASYNC_BATCHING = "HYPERGATE_ASYNC_BATCHING"
 
 # Default Fallback Pricing Matrix (reconciled against config/model_pricing.json)
 DEFAULT_PRICING: Dict[str, Dict[str, Any]] = {
@@ -307,12 +314,43 @@ class TelemetryRecord:
         return asdict(self)
 
 
+@runtime_checkable
+class GatewayTelemetryStore(Protocol):
+    """Protocol for pluggable HyperGate gateway telemetry sinks (SQLite WAL or Postgres)."""
+    def record_turn(self, record: TelemetryRecord): ...
+    def get_trace_records(self, trace_id: str) -> List[Dict[str, Any]]: ...
+    def list_traces(self, limit: int = 50) -> List[Dict[str, Any]]: ...
+    def get_summary(self) -> Dict[str, Any]: ...
+    def flush(self, timeout: float = 5.0) -> bool: ...
+    def close(self): ...
+
+
+def _atexit_flush_hg_sink(sink_ref: "weakref.ReferenceType[TelemetrySink]"):
+    sk = sink_ref()
+    if sk is not None:
+        try:
+            sk.close()
+        except Exception:
+            pass
+
+
 class TelemetrySink:
     """
-    Persistent disk & SQLite telemetry sink.
-    Records every HyperGate routing turn, cost delta, and circuit tripwire event.
+    Hardened async persistent disk & SQLite WAL telemetry sink.
+    Features:
+    - Dedicated single-writer async batching daemon (non-blocking record_turn).
+    - Sentinel-based flush() & close() guaranteeing zero dropped turns.
+    - Lock-free ?mode=ro query_only readers aggregating across PID shards seamlessly.
     """
-    def __init__(self, base_dir: Optional[str] = None):
+    def __init__(
+        self,
+        base_dir: Optional[str] = None,
+        async_batching: Optional[bool] = None,
+        batch_size: int = 128,
+        flush_interval_ms: float = 25.0,
+        max_queue_size: int = 10000,
+        shard_by_pid: Optional[bool] = None,
+    ):
         candidates = [
             base_dir,
             os.environ.get("HYPERGATE_TRACE_DIR"),
@@ -340,97 +378,364 @@ class TelemetrySink:
 
         self.base_dir = chosen or tempfile.mkdtemp(prefix="hypergate_traces_")
         os.makedirs(self.base_dir, mode=0o700, exist_ok=True)
-        self.db_path = os.path.join(self.base_dir, "hypergate_telemetry.db")
+
+        self.shard_by_pid = (
+            shard_by_pid
+            if shard_by_pid is not None
+            else (os.environ.get(ENV_SHARD_BY_PID, "").lower() in ("1", "true", "yes"))
+        )
+        if async_batching is not None:
+            self.async_batching = bool(async_batching)
+        else:
+            env_async = os.environ.get(ENV_ASYNC_BATCHING, "true").lower()
+            self.async_batching = env_async not in ("0", "false", "no")
+
+        db_filename = f"hypergate_telemetry_pid_{os.getpid()}.db" if self.shard_by_pid else "hypergate_telemetry.db"
+        self.db_path = os.path.join(self.base_dir, db_filename)
+
+        self.batch_size = max(1, int(batch_size))
+        self.flush_interval_ms = max(1.0, float(flush_interval_ms))
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10.0)
+        self._closed = False
+
+        self.stats: Dict[str, int] = {
+            "enqueued_records": 0,
+            "committed_records": 0,
+            "batches_committed": 0,
+            "dropped_records": 0,
+            "sqlite_retries": 0,
+            "sqlite_errors": 0,
+        }
+
+        self._conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=30.0,
+            isolation_level=None,
+        )
+        self._configure_write_conn(self._conn)
         self._init_sqlite()
 
+        self._write_queue: queue.Queue = queue.Queue(maxsize=max(16, int(max_queue_size)))
+        self._writer_thread: Optional[threading.Thread] = None
+        if self.async_batching:
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop,
+                name=f"hypergate-writer-{os.getpid()}",
+                daemon=True,
+            )
+            self._writer_thread.start()
+            atexit.register(_atexit_flush_hg_sink, weakref.ref(self))
+
+    def _run_with_busy_retry(self, fn: Callable[[], Any], max_retries: int = 25):
+        for attempt in range(max_retries):
+            try:
+                return fn()
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < max_retries - 1:
+                    self.stats["sqlite_retries"] += 1
+                    delay = min(0.002 * (1.4 ** attempt) + random.uniform(0.0, 0.004), 0.15)
+                    time.sleep(delay)
+                    continue
+                raise
+
+    def _configure_write_conn(self, conn: sqlite3.Connection):
+        conn.execute("PRAGMA busy_timeout=5000;")
+        self._run_with_busy_retry(lambda: conn.execute("PRAGMA journal_mode=WAL;"))
+        self._run_with_busy_retry(lambda: conn.execute("PRAGMA synchronous=NORMAL;"))
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute("PRAGMA cache_size=-64000;")
+        conn.execute("PRAGMA wal_autocheckpoint=1000;")
+        try:
+            conn.execute("PRAGMA mmap_size=268435456;")
+        except sqlite3.Error:
+            pass
+
     def _init_sqlite(self):
-        with self._lock:
-            cur = self._conn.cursor()
-            cur.execute("PRAGMA journal_mode=WAL;")
-            cur.execute("PRAGMA synchronous=NORMAL;")
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS hypergate_turns (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    trace_id TEXT NOT NULL,
-                    turn INTEGER NOT NULL,
-                    timestamp_iso TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    tier TEXT NOT NULL,
-                    prompt_tokens INTEGER,
-                    completion_tokens INTEGER,
-                    total_tokens INTEGER,
-                    turn_cost_usd REAL,
-                    rolling_cost_usd REAL,
-                    budget_ceiling_usd REAL,
-                    overhead_ms REAL,
-                    circuit_tripped INTEGER,
-                    status_code INTEGER,
-                    error TEXT
-                );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_trace ON hypergate_turns (trace_id);")
-            self._conn.commit()
+        ddl = [
+            """
+            CREATE TABLE IF NOT EXISTS hypergate_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT NOT NULL,
+                turn INTEGER NOT NULL,
+                timestamp_iso TEXT NOT NULL,
+                model TEXT NOT NULL,
+                tier TEXT NOT NULL,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                total_tokens INTEGER,
+                turn_cost_usd REAL,
+                rolling_cost_usd REAL,
+                budget_ceiling_usd REAL,
+                overhead_ms REAL,
+                circuit_tripped INTEGER,
+                status_code INTEGER,
+                error TEXT
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_trace ON hypergate_turns (trace_id);",
+        ]
+
+        def _apply_ddl():
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE;")
+                try:
+                    for stmt in ddl:
+                        self._conn.execute(stmt)
+                    self._conn.execute("COMMIT;")
+                except Exception:
+                    try:
+                        self._conn.execute("ROLLBACK;")
+                    except sqlite3.Error:
+                        pass
+                    raise
+
+        self._run_with_busy_retry(_apply_ddl)
+
+    def _commit_batch(self, rec_dicts: List[Dict[str, Any]]):
+        if not rec_dicts:
+            return
+
+        # 1. Grouped JSONL appends
+        grouped_lines: Dict[str, List[str]] = {}
+        for rd in rec_dicts:
+            tid = str(rd.get("trace_id", ""))
+            if _TRACE_ID_RE.fullmatch(tid):
+                grouped_lines.setdefault(tid, []).append(json.dumps(rd, default=str) + "\n")
+
+        for tid, lines in grouped_lines.items():
+            jsonl_path = os.path.join(self.base_dir, f"{tid}.jsonl")
+            payload_bytes = "".join(lines).encode("utf-8")
+            try:
+                fd = os.open(
+                    jsonl_path,
+                    os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                try:
+                    os.write(fd, payload_bytes)
+                finally:
+                    os.close(fd)
+            except OSError as e:
+                print(f"[HyperGate TelemetrySink] Warning appending JSONL: {e}", file=sys.stderr)
+
+        # 2. Batched SQLite WAL insert inside BEGIN IMMEDIATE
+        rows = [
+            (
+                rd["trace_id"],
+                rd["turn"],
+                rd["timestamp_iso"],
+                rd["model"],
+                rd["tier"],
+                rd["prompt_tokens"],
+                rd["completion_tokens"],
+                rd["total_tokens"],
+                rd["turn_cost_usd"],
+                rd["rolling_cost_usd"],
+                rd["budget_ceiling_usd"],
+                rd["overhead_ms"],
+                1 if rd.get("circuit_tripped") else 0,
+                rd["status_code"],
+                rd.get("error"),
+            )
+            for rd in rec_dicts
+        ]
+
+        def _do_insert():
+            with self._lock:
+                if self._conn is None:
+                    return False
+                cur = self._conn.cursor()
+                cur.execute("BEGIN IMMEDIATE;")
+                try:
+                    cur.executemany(
+                        """
+                        INSERT INTO hypergate_turns (
+                            trace_id, turn, timestamp_iso, model, tier,
+                            prompt_tokens, completion_tokens, total_tokens,
+                            turn_cost_usd, rolling_cost_usd, budget_ceiling_usd,
+                            overhead_ms, circuit_tripped, status_code, error
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows,
+                    )
+                    cur.execute("COMMIT;")
+                    return True
+                except Exception:
+                    try:
+                        cur.execute("ROLLBACK;")
+                    except sqlite3.Error:
+                        pass
+                    raise
+
+        try:
+            committed = self._run_with_busy_retry(_do_insert)
+            if committed:
+                self.stats["committed_records"] += len(rows)
+                self.stats["batches_committed"] += 1
+        except Exception as e:
+            self.stats["sqlite_errors"] += 1
+            print(f"[HyperGate TelemetrySink] Warning inserting SQLite batch: {e}", file=sys.stderr)
+
+    def _writer_loop(self):
+        interval_s = self.flush_interval_ms / 1000.0
+        stopping = False
+        while not stopping:
+            rec_dicts: List[Dict[str, Any]] = []
+            flush_events: List[threading.Event] = []
+            stop_events: List[threading.Event] = []
+
+            try:
+                first = self._write_queue.get(timeout=interval_s)
+            except queue.Empty:
+                continue
+
+            items = [first]
+            while len(items) < self.batch_size:
+                try:
+                    items.append(self._write_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            for kind, payload in items:
+                if kind == "REC":
+                    rec_dicts.append(payload)
+                elif kind == "FLUSH":
+                    flush_events.append(payload)
+                elif kind == "STOP":
+                    stopping = True
+                    stop_events.append(payload)
+
+            if rec_dicts:
+                self._commit_batch(rec_dicts)
+
+            for ev in flush_events:
+                ev.set()
+
+            if stopping:
+                while True:
+                    rem_recs: List[Dict[str, Any]] = []
+                    rem_flushes: List[threading.Event] = []
+                    for _ in range(self.batch_size):
+                        try:
+                            k, p = self._write_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if k == "REC":
+                            rem_recs.append(p)
+                        elif k == "FLUSH":
+                            rem_flushes.append(p)
+                        elif k == "STOP":
+                            stop_events.append(p)
+                    if not rem_recs and not rem_flushes:
+                        break
+                    if rem_recs:
+                        self._commit_batch(rem_recs)
+                    for ev in rem_flushes:
+                        ev.set()
+                for ev in stop_events:
+                    ev.set()
 
     def record_turn(self, record: TelemetryRecord):
+        if self._closed:
+            return
         if not record.timestamp_iso:
             record.timestamp_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         if not _TRACE_ID_RE.fullmatch(str(record.trace_id)):
             record.trace_id = f"trc_{uuid.uuid4().hex[:12]}"
 
-        # 1. Append to local JSONL file for raw streaming (O_NOFOLLOW + 0o600)
-        jsonl_path = os.path.join(self.base_dir, f"{record.trace_id}.jsonl")
-        line = json.dumps(record.to_dict(), default=str) + "\n"
-        try:
-            fd = os.open(jsonl_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            with os.fdopen(fd, "a", encoding="utf-8") as f:
-                f.write(line)
-        except OSError as e:
-            print(f"[HyperGate TelemetrySink] Warning appending JSONL: {e}", file=sys.stderr)
+        rd = record.to_dict()
+        if not self.async_batching:
+            self._commit_batch([rd])
+            self.stats["enqueued_records"] += 1
+            return
 
-        # 2. Insert into persistent WAL SQLite connection
-        with self._lock:
+        try:
+            self._write_queue.put_nowait(("REC", rd))
+            self.stats["enqueued_records"] += 1
+        except queue.Full:
             try:
-                cur = self._conn.cursor()
-                cur.execute("""
-                    INSERT INTO hypergate_turns (
-                        trace_id, turn, timestamp_iso, model, tier,
-                        prompt_tokens, completion_tokens, total_tokens,
-                        turn_cost_usd, rolling_cost_usd, budget_ceiling_usd,
-                        overhead_ms, circuit_tripped, status_code, error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    record.trace_id, record.turn, record.timestamp_iso, record.model, record.tier,
-                    record.prompt_tokens, record.completion_tokens, record.total_tokens,
-                    record.turn_cost_usd, record.rolling_cost_usd, record.budget_ceiling_usd,
-                    record.overhead_ms, 1 if record.circuit_tripped else 0, record.status_code, record.error
-                ))
-                self._conn.commit()
-            except Exception as e:
-                print(f"[HyperGate TelemetrySink] Warning inserting SQLite: {e}", file=sys.stderr)
+                self._write_queue.put(("REC", rd), timeout=0.05)
+                self.stats["enqueued_records"] += 1
+            except queue.Full:
+                self.stats["dropped_records"] += 1
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Blocks until all queued telemetry turns are committed to SQLite WAL."""
+        if not self.async_batching or self._closed:
+            return True
+        if self._writer_thread is None or not self._writer_thread.is_alive():
+            return True
+        evt = threading.Event()
+        try:
+            self._write_queue.put(("FLUSH", evt), timeout=timeout)
+        except queue.Full:
+            return False
+        return evt.wait(timeout=timeout)
+
+    def _discover_db_files(self) -> List[str]:
+        files: List[str] = []
+        seen = set()
+        if os.path.exists(self.db_path):
+            ap = os.path.abspath(self.db_path)
+            files.append(ap)
+            seen.add(ap)
+        try:
+            for entry in os.scandir(self.base_dir):
+                if entry.is_file() and (
+                    entry.name == "hypergate_telemetry.db"
+                    or (entry.name.startswith("hypergate_telemetry_pid_") and entry.name.endswith(".db"))
+                ):
+                    ap = os.path.abspath(entry.path)
+                    if ap not in seen:
+                        files.append(ap)
+                        seen.add(ap)
+        except OSError:
+            pass
+        return files
+
+    def _open_readonly(self, db_path: str) -> sqlite3.Connection:
+        db_uri = pathlib.Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        return conn
 
     def get_trace_records(self, trace_id: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+        self.flush(timeout=5.0)
+        all_rows: List[Dict[str, Any]] = []
+        for db_file in self._discover_db_files():
+            conn = None
             try:
+                conn = self._open_readonly(db_file)
                 cur = conn.cursor()
                 cur.execute("SELECT * FROM hypergate_turns WHERE trace_id = ? ORDER BY id ASC", (trace_id,))
-                rows = cur.fetchall()
-                return [dict(r) for r in rows]
+                for r in cur.fetchall():
+                    all_rows.append(dict(r))
+            except Exception:
+                pass
             finally:
-                conn.close()
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        all_rows.sort(key=lambda r: (r.get("timestamp_iso") or "", int(r.get("turn") or 0), int(r.get("id") or 0)))
+        return all_rows
 
     def list_traces(self, limit: int = 50) -> List[Dict[str, Any]]:
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+        self.flush(timeout=5.0)
+        merged: Dict[str, Dict[str, Any]] = {}
+        for db_file in self._discover_db_files():
+            conn = None
             try:
+                conn = self._open_readonly(db_file)
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT 
+                    SELECT
                         trace_id,
                         COUNT(*) as turns,
                         MIN(timestamp_iso) as started_at,
@@ -440,42 +745,141 @@ class TelemetrySink:
                         GROUP_CONCAT(DISTINCT tier) as tiers_used
                     FROM hypergate_turns
                     GROUP BY trace_id
-                    ORDER BY id DESC
-                    LIMIT ?
-                """, (limit,))
-                rows = cur.fetchall()
-                return [dict(r) for r in rows]
+                """)
+                for r in cur.fetchall():
+                    tid = r["trace_id"]
+                    tiers_set = {t for t in (r["tiers_used"] or "").split(",") if t}
+                    if tid not in merged:
+                        merged[tid] = {
+                            "trace_id": tid,
+                            "turns": int(r["turns"] or 0),
+                            "started_at": r["started_at"],
+                            "finished_at": r["finished_at"],
+                            "total_cost_usd": float(r["total_cost_usd"] or 0.0),
+                            "circuit_tripped": int(r["circuit_tripped"] or 0),
+                            "_tiers": tiers_set,
+                        }
+                    else:
+                        acc = merged[tid]
+                        acc["turns"] += int(r["turns"] or 0)
+                        if r["started_at"] and (not acc["started_at"] or r["started_at"] < acc["started_at"]):
+                            acc["started_at"] = r["started_at"]
+                        if r["finished_at"] and (not acc["finished_at"] or r["finished_at"] > acc["finished_at"]):
+                            acc["finished_at"] = r["finished_at"]
+                        acc["total_cost_usd"] = max(acc["total_cost_usd"], float(r["total_cost_usd"] or 0.0))
+                        acc["circuit_tripped"] = max(acc["circuit_tripped"], int(r["circuit_tripped"] or 0))
+                        acc["_tiers"].update(tiers_set)
+            except Exception:
+                pass
             finally:
-                conn.close()
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        out = [
+            {
+                "trace_id": acc["trace_id"],
+                "turns": acc["turns"],
+                "started_at": acc["started_at"],
+                "finished_at": acc["finished_at"],
+                "total_cost_usd": acc["total_cost_usd"],
+                "circuit_tripped": acc["circuit_tripped"],
+                "tiers_used": ",".join(sorted(acc["_tiers"])),
+            }
+            for acc in merged.values()
+        ]
+        out.sort(key=lambda x: (x["finished_at"] or "", x["started_at"] or ""), reverse=True)
+        return out[:limit]
 
     def get_summary(self) -> Dict[str, Any]:
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+        self.flush(timeout=5.0)
+        distinct_traces: Set[str] = set()
+        total_turns = 0
+        total_tokens_processed = 0
+        total_spent_usd = 0.0
+        total_overhead_sum = 0.0
+        total_circuits_tripped = 0
+        tier_breakdown: Dict[str, Dict[str, Any]] = {}
+
+        for db_file in self._discover_db_files():
+            conn = None
             try:
+                conn = self._open_readonly(db_file)
                 cur = conn.cursor()
+                cur.execute("SELECT DISTINCT trace_id FROM hypergate_turns")
+                for row in cur.fetchall():
+                    distinct_traces.add(row["trace_id"])
+
                 cur.execute("""
-                    SELECT 
-                        COUNT(DISTINCT trace_id) as total_traces,
+                    SELECT
                         COUNT(*) as total_turns,
                         COALESCE(SUM(total_tokens), 0) as total_tokens_processed,
                         COALESCE(SUM(turn_cost_usd), 0.0) as total_spent_usd,
-                        COALESCE(AVG(overhead_ms), 0.0) as avg_overhead_ms,
+                        COALESCE(SUM(overhead_ms), 0.0) as sum_overhead_ms,
                         COALESCE(SUM(circuit_tripped), 0) as total_circuits_tripped
                     FROM hypergate_turns
                 """)
-                summary_row = dict(cur.fetchone())
+                srow = cur.fetchone()
+                total_turns += int(srow["total_turns"] or 0)
+                total_tokens_processed += int(srow["total_tokens_processed"] or 0)
+                total_spent_usd += float(srow["total_spent_usd"] or 0.0)
+                total_overhead_sum += float(srow["sum_overhead_ms"] or 0.0)
+                total_circuits_tripped += int(srow["total_circuits_tripped"] or 0)
 
                 cur.execute("""
                     SELECT tier, COUNT(*) as count, COALESCE(SUM(turn_cost_usd), 0.0) as spent
                     FROM hypergate_turns
                     GROUP BY tier
                 """)
-                tier_breakdown = {r["tier"]: {"turns": r["count"], "spent": r["spent"]} for r in cur.fetchall()}
-                summary_row["tier_breakdown"] = tier_breakdown
-                return summary_row
+                for r in cur.fetchall():
+                    t_name = r["tier"]
+                    if t_name not in tier_breakdown:
+                        tier_breakdown[t_name] = {"turns": 0, "spent": 0.0}
+                    tier_breakdown[t_name]["turns"] += int(r["count"] or 0)
+                    tier_breakdown[t_name]["spent"] += float(r["spent"] or 0.0)
+            except Exception:
+                pass
             finally:
-                conn.close()
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        avg_overhead = (total_overhead_sum / total_turns) if total_turns > 0 else 0.0
+        return {
+            "total_traces": len(distinct_traces),
+            "total_turns": total_turns,
+            "total_tokens_processed": total_tokens_processed,
+            "total_spent_usd": total_spent_usd,
+            "avg_overhead_ms": avg_overhead,
+            "total_circuits_tripped": total_circuits_tripped,
+            "tier_breakdown": tier_breakdown,
+        }
+
+    def close(self):
+        """Flushes queued telemetry records, joins writer thread, and closes SQLite connection."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._writer_thread is not None and self._writer_thread.is_alive():
+            evt = threading.Event()
+            try:
+                self._write_queue.put(("STOP", evt), timeout=2.0)
+                evt.wait(timeout=3.0)
+            except Exception:
+                pass
+            self._writer_thread.join(timeout=3.0)
+
+        with self._lock:
+            if hasattr(self, "_conn") and self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
 
 
 class HyperGateRouter:
@@ -484,14 +888,39 @@ class HyperGateRouter:
     Exposes direct wire-format dispatch for zero-overhead in-process routing
     and powers the HTTP gateway handler.
     """
-    def __init__(self, config_path: Optional[str] = None, trace_dir: Optional[str] = None):
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        trace_dir: Optional[str] = None,
+        telemetry_sink: Optional[GatewayTelemetryStore] = None,
+        shard_by_pid: Optional[bool] = None,
+        async_batching: Optional[bool] = None,
+    ):
         self.pricing_engine = PricingEngine(config_path)
         self.budget_ledger = BudgetLedger(
             default_limit_usd=self.pricing_engine.default_budget_limit,
             default_max_turns=self.pricing_engine.default_max_turns
         )
         self.classifier = SystemOneClassifier()
-        self.telemetry = TelemetrySink(base_dir=trace_dir)
+        if telemetry_sink is not None:
+            self.telemetry: GatewayTelemetryStore = telemetry_sink
+        else:
+            self.telemetry = TelemetrySink(
+                base_dir=trace_dir,
+                shard_by_pid=shard_by_pid,
+                async_batching=async_batching,
+            )
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Flushes buffered telemetry turns to persistent storage."""
+        if hasattr(self, "telemetry") and self.telemetry is not None and hasattr(self.telemetry, "flush"):
+            return bool(self.telemetry.flush(timeout=timeout))
+        return True
+
+    def close(self):
+        """Flushes and closes telemetry sink resources."""
+        if hasattr(self, "telemetry") and self.telemetry is not None and hasattr(self.telemetry, "close"):
+            self.telemetry.close()
 
     def handle_chat_completion(
         self, req_json: Dict[str, Any], headers: Optional[Dict[str, str]] = None
@@ -1509,16 +1938,14 @@ def main():
         print("=" * 60)
         print(f"• Telemetry SQLite DB: {sink.db_path}")
         try:
-            with sqlite3.connect(sink.db_path) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT count(*), coalesce(sum(cost_usd), 0), coalesce(avg(latency_ms), 0) FROM traces")
-                row = cur.fetchone()
-                count, total_cost, avg_lat = row[0], row[1], row[2]
-                print(f"• Total Logged Traces: {count}")
-                print(f"• Total Recorded Cost: ${total_cost:.5f} USD")
-                print(f"• Average Latency:     {avg_lat:.2f} ms")
+            summary = sink.get_summary()
+            print(f"• Total Logged Traces: {summary['total_traces']} ({summary['total_turns']} turns)")
+            print(f"• Total Recorded Cost: ${summary['total_spent_usd']:.5f} USD")
+            print(f"• Average Latency:     {summary['avg_overhead_ms']:.2f} ms")
         except Exception as e:
             print(f"• Notice: {e}")
+        finally:
+            sink.close()
         print("=" * 60)
         return
 

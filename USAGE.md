@@ -83,13 +83,17 @@ HyperGate **aborts upstream model dispatch immediately with zero tokens burned**
 
 ## 4. Python SDK Integration (`hypergate-py`)
 
-`hypergate-py` is strictly **zero external dependencies** and uses pure Python standard library (`urllib.request`, `json`, `dataclasses`, `time`, `threading`).
+`hypergate-py` is strictly **zero external dependencies** and uses pure Python standard library (`urllib.request`, `json`, `dataclasses`, `time`, `threading`). Execute from the repository root with `PYTHONPATH=hypergate-py` (or insert `hypergate-py` onto `sys.path`).
+
+> **Scope Note**: Both the in-process `HyperGateRouter` and embedded `HyperGateServer` run as local policy, classification, tool-pruning, cost-accounting, and budget-breaker simulation dispatchers — they return `[HyperGate ...]` synthetic payloads without forwarding requests to external upstream LLM endpoints (`hypergate-rs` covers standalone HTTP reverse proxying).
 
 ### Option A: Network Gateway Mode (HTTP)
 ```python
+import sys
+sys.path.insert(0, "hypergate-py")
 from hypergate import HyperGateClient, CircuitBreakerError
 
-# Connect to running HyperGate proxy (Rust or Docker)
+# Connect to running HyperGate proxy (Rust or embedded HyperGateServer)
 client = HyperGateClient(
     base_url="http://127.0.0.1:8080",
     trace_id="session_task_44a",
@@ -110,11 +114,11 @@ except CircuitBreakerError as e:
 ```
 
 ### Option B: In-Process Zero-Overhead Router Mode
-For local agent loops where launching a separate daemon is undesirable:
+For local agent loops where launching a separate daemon is undesirable (assumes `hypergate-py` is on `sys.path` / `PYTHONPATH`):
 ```python
 from hypergate import HyperGateRouter, HyperGateClient, CircuitBreakerError
 
-# In-process router binding (3-microsecond routing latency)
+# In-process policy & simulation router binding (microsecond routing latency)
 router = HyperGateRouter("config/model_pricing.json")
 client = HyperGateClient(router=router, budget_limit_usd=0.25)
 
@@ -139,7 +143,7 @@ HyperGate natively coordinates Model Context Protocol (MCP) stdio servers:
 from hypergate import ZeroMCPSupervisor, CircuitBreakerError
 
 supervisor = ZeroMCPSupervisor(
-    server_cmd=["python3", "0_Projects/ZeroMCP/zeromcp-py/server.py"],
+    server_cmd=["python3", "../ZeroMCP/zeromcp-py/zeromcp.py"],
     budget_limit_usd=0.10,
     max_turns=20
 )
@@ -199,22 +203,30 @@ This sanitizes incubator bridges, runs test suites, and initializes a clean Git 
 
 HyperGate automatically records every routing decision, token attribution, latency curve, and circuit-breaker event locally with zero external network overhead.
 
-### Storage Layout
-- **Append-Only JSONL Streams**: `~/.hypergate/traces/{trace_id}.jsonl` (or `$HYPERGATE_TRACE_DIR`)
-- **Relational SQLite Store**: `~/.hypergate/traces/hypergate_telemetry.db`
+### Storage Layout & Resolution Order
+`TelemetrySink` resolves its storage directory in strict priority order:
+1. Explicit `base_dir` / CLI `--trace-dir <dir>`
+2. `$HYPERGATE_TRACE_DIR` environment variable
+3. `~/.hypergate/traces` (default user-home location)
+4. `<cwd>/.hypergate/traces` (fallback only if user home is unavailable)
+5. Private `tempfile.mkdtemp(prefix="hypergate_traces_")`
+
+Within the resolved directory:
+- **Append-Only JSONL Streams**: `<trace_dir>/{trace_id}.jsonl`
+- **Relational SQLite Store**: `<trace_dir>/hypergate_telemetry.db` (or `hypergate_telemetry_pid_<pid>.db` when `HYPERGATE_SHARD_BY_PID=1`)
 
 ### Audit CLI Commands
-Inspect agent execution graphs and circuit trip events:
+Inspect agent execution graphs and circuit trip events from the repository root:
 
 ```bash
 # Display aggregate gateway metrics and tier breakdown
-python3 -m hypergate.audit --summary
+python3 hypergate-py/audit.py --summary
 
 # List recent agent traces with total cost and circuit statuses
-python3 -m hypergate.audit --list
+python3 hypergate-py/audit.py --list
 
 # Turn-by-turn deep-dive into a specific agent trace
-python3 -m hypergate.audit --trace <trace_id>
+python3 hypergate-py/audit.py --trace <trace_id>
 ```
 
 ---

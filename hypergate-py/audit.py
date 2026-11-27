@@ -6,9 +6,9 @@ Inspects persistent agent execution traces, cost breakdown, latency curves,
 and circuit-breaker trip events.
 
 Usage:
-  python3 -m hypergate.audit --list
-  python3 -m hypergate.audit --trace <trace_id>
-  python3 -m hypergate.audit --summary
+  python3 hypergate-py/audit.py --list
+  python3 hypergate-py/audit.py --trace <trace_id>
+  python3 hypergate-py/audit.py --summary
 """
 
 import os
@@ -62,7 +62,7 @@ def print_trace_details(sink: TelemetrySink, trace_id: str):
 def print_traces_list(sink: TelemetrySink, limit: int = 50):
     traces = sink.list_traces(limit=limit)
     if not traces:
-        print("ℹ️ No agent traces recorded yet.")
+        print("ℹ️ No agent traces recorded yet. Specify --trace-dir <dir> or set $HYPERGATE_TRACE_DIR.")
         return
 
     print(f"\n================================================================================")
@@ -112,6 +112,7 @@ def main():
 
     args = parser.parse_args()
     sink = TelemetrySink(base_dir=args.trace_dir)
+    print(f"📂 Resolved Trace Directory: {sink.base_dir}")
 
     if args.trace:
         print_trace_details(sink, args.trace)

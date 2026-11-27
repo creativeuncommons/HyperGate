@@ -104,7 +104,8 @@ HyperGate/
 │       └── handlers.rs       # HTTP /v1/chat/completions wire format
 ├── hypergate-py/             # Zero-dependency Python SDK & ZeroMCP bridge
 │   ├── __init__.py
-│   └── hypergate.py          # Standalone client, in-process router, and MCP supervisor
+│   ├── hypergate.py          # Standalone client, in-process router, and MCP supervisor
+│   └── audit.py              # Telemetry summary, trace listing, and trace inspection CLI
 ├── benchmarks/
 │   └── benchmark.py          # Latency & RSS benchmark harness
 ├── tests/
@@ -120,12 +121,14 @@ HyperGate/
 
 ### 1. Python Zero-Dependency Client (`hypergate-py`)
 
-No third-party packages required (`pip install` nothing):
+No third-party packages required (`pip install` nothing — add `hypergate-py` to `sys.path` or run with `PYTHONPATH=hypergate-py` from the repository root). Note that the pure-Python `HyperGateRouter` and embedded `HyperGateServer` act as **local policy & simulation dispatchers** (evaluating System-One tiers, BM25 tool pruning, token pricing, and budget circuit-breakers locally without making external upstream HTTP LLM calls; upstream HTTP proxying is scoped to `hypergate-rs`):
 
 ```python
+import sys
+sys.path.insert(0, "hypergate-py")
 from hypergate import HyperGateRouter, HyperGateClient, CircuitBreakerError
 
-# Zero-overhead in-process router
+# Zero-overhead in-process policy & simulation router (auto-resolves config/model_pricing.json)
 router = HyperGateRouter("config/model_pricing.json")
 client = HyperGateClient(router=router, budget_limit_usd=0.25)
 

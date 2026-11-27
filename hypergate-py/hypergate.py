@@ -27,7 +27,7 @@ import math
 import re
 import hmac
 import tempfile
-from collections import defaultdict
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, List, Optional, Tuple, Callable, Set, Protocol, runtime_checkable
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -36,6 +36,28 @@ _TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MAX_GATEWAY_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
 ENV_SHARD_BY_PID = "HYPERGATE_SHARD_BY_PID"
 ENV_ASYNC_BATCHING = "HYPERGATE_ASYNC_BATCHING"
+
+
+def _content_text(msg: Any) -> str:
+    """Safely extracts plain text from OpenAI/Anthropic str, None, or block-list message content."""
+    raw = msg.get("content", "") if isinstance(msg, dict) else msg
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        parts: List[str] = []
+        for item in raw:
+            if isinstance(item, dict):
+                txt = item.get("text")
+                if isinstance(txt, str):
+                    parts.append(txt)
+                elif isinstance(item.get("content"), (str, list)):
+                    parts.append(_content_text(item.get("content")))
+            elif isinstance(item, str):
+                parts.append(item)
+        return " ".join(p for p in parts if p)
+    return str(raw)
 
 # Default Fallback Pricing Matrix (reconciled against config/model_pricing.json)
 DEFAULT_PRICING: Dict[str, Dict[str, Any]] = {
@@ -132,9 +154,15 @@ class PricingEngine:
         self.default_budget_limit: float = 0.50
         self.default_max_turns: int = 30
 
-        if config_path and os.path.exists(config_path):
+        resolved_path = config_path or os.environ.get("HYPERGATE_CONFIG")
+        if not resolved_path:
+            default_pkg_cfg = pathlib.Path(__file__).resolve().parent.parent / "config" / "model_pricing.json"
+            if default_pkg_cfg.is_file():
+                resolved_path = str(default_pkg_cfg)
+
+        if resolved_path and os.path.exists(resolved_path):
             try:
-                with open(config_path, "r", encoding="utf-8") as f:
+                with open(resolved_path, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
                     self.char_ratio = float(cfg.get("char_to_token_ratio", 4.0))
                     self.default_budget_limit = float(cfg.get("default_budget_limit_usd", 0.50))
@@ -174,25 +202,58 @@ class PricingEngine:
 
 class BudgetLedger:
     """Thread-safe token and cost ledger across traces and sessions with Observation & Profiling modes."""
-    def __init__(self, default_limit_usd: float = 0.50, default_max_turns: int = 30, mode: Optional[str] = None):
+    def __init__(
+        self,
+        default_limit_usd: float = 0.50,
+        default_max_turns: int = 30,
+        mode: Optional[str] = None,
+        max_sessions: int = 50_000,
+        idle_ttl_sec: float = 3600.0,
+    ):
         self._lock = threading.RLock()
-        self._sessions: Dict[str, SessionState] = {}
+        self._sessions: "OrderedDict[str, SessionState]" = OrderedDict()
         self.default_limit_usd = default_limit_usd
         self.default_max_turns = default_max_turns
         self.mode = mode or os.environ.get("HYPERGATE_MODE", "enforce")
+        self.max_sessions = max(1, int(max_sessions))
+        self.idle_ttl_sec = max(0.0, float(idle_ttl_sec))
+
+    def _evict_if_needed(self, now: float) -> None:
+        if self.idle_ttl_sec > 0.0 and len(self._sessions) >= self.max_sessions:
+            expired = [
+                k for k, st in self._sessions.items()
+                if (not st.circuit_tripped) and (now - st.last_active > self.idle_ttl_sec)
+            ]
+            for k in expired:
+                self._sessions.pop(k, None)
+        while len(self._sessions) >= self.max_sessions:
+            victim = None
+            for k, st in self._sessions.items():
+                if not st.circuit_tripped:
+                    victim = k
+                    break
+            if victim is None:
+                self._sessions.popitem(last=False)
+            else:
+                self._sessions.pop(victim, None)
 
     def get_or_create(self, trace_id: Optional[str] = None, budget_limit: Optional[float] = None, mode: Optional[str] = None) -> SessionState:
         with self._lock:
             tid = trace_id or f"trc_{uuid.uuid4().hex[:12]}"
-            if tid not in self._sessions:
-                limit = budget_limit if budget_limit is not None else self.default_limit_usd
-                active_mode = mode if mode is not None else self.mode
-                self._sessions[tid] = SessionState(
-                    trace_id=tid,
-                    budget_limit_usd=limit,
-                    max_turns=self.default_max_turns,
-                    mode=active_mode
-                )
+            now = time.time()
+            if tid in self._sessions:
+                self._sessions.move_to_end(tid)
+                return self._sessions[tid]
+            self._evict_if_needed(now)
+            limit = budget_limit if budget_limit is not None else self.default_limit_usd
+            active_mode = mode if mode is not None else self.mode
+            self._sessions[tid] = SessionState(
+                trace_id=tid,
+                budget_limit_usd=limit,
+                max_turns=self.default_max_turns,
+                mode=active_mode,
+                last_active=now,
+            )
             return self._sessions[tid]
 
     def record_cost(self, trace_id: str, cost_usd: float) -> Tuple[float, bool]:
@@ -254,7 +315,7 @@ class SystemOneClassifier:
         if not messages:
             return 1, "empty_message_fast_path"
 
-        last_msg = messages[-1].get("content", "").strip()
+        last_msg = _content_text(messages[-1]).strip()
         lower = last_msg.lower()
 
         # Check Cache (Tier 0)
@@ -354,8 +415,8 @@ class TelemetrySink:
         candidates = [
             base_dir,
             os.environ.get("HYPERGATE_TRACE_DIR"),
-            os.path.join(os.getcwd(), ".hypergate", "traces"),
             os.path.expanduser("~/.hypergate/traces"),
+            os.path.join(os.getcwd(), ".hypergate", "traces"),
         ]
         chosen = None
         for cand in candidates:
@@ -926,18 +987,65 @@ class HyperGateRouter:
         self, req_json: Dict[str, Any], headers: Optional[Dict[str, str]] = None
     ) -> Tuple[int, Dict[str, Any], Dict[str, str]]:
         t0 = time.perf_counter()
-        headers = headers or {}
+        if not isinstance(req_json, dict):
+            return (
+                400,
+                {"error": {"code": "invalid_request", "message": "Request body must be a JSON object", "type": "invalid_request_error"}},
+                {},
+            )
+
+        headers = {str(k).lower(): v for k, v in (headers or {}).items()}
 
         raw_trace_id = headers.get("x-hypergate-trace-id") or req_json.get("trace_id") or ""
         if raw_trace_id and _TRACE_ID_RE.fullmatch(str(raw_trace_id)):
             trace_id = str(raw_trace_id)
         else:
             trace_id = f"trc_{uuid.uuid4().hex[:12]}"
-        budget_limit = float(headers.get("x-hypergate-budget-limit", self.budget_ledger.default_limit_usd))
+
+        raw_budget = headers.get("x-hypergate-budget-limit", self.budget_ledger.default_limit_usd)
+        try:
+            budget_limit = float(raw_budget)
+        except (TypeError, ValueError):
+            return (
+                400,
+                {"error": {"code": "invalid_header", "message": f"x-hypergate-budget-limit must be a finite number, got {raw_budget!r}", "type": "invalid_request_error"}},
+                {},
+            )
+        if not math.isfinite(budget_limit) or budget_limit < 0.0:
+            return (
+                400,
+                {"error": {"code": "invalid_header", "message": "x-hypergate-budget-limit must be finite and >= 0", "type": "invalid_request_error"}},
+                {},
+            )
+
+        raw_top_k = headers.get("x-hypergate-tools-top-k", 8)
+        try:
+            top_k_tools = int(raw_top_k)
+        except (TypeError, ValueError):
+            return (
+                400,
+                {"error": {"code": "invalid_header", "message": f"x-hypergate-tools-top-k must be an integer, got {raw_top_k!r}", "type": "invalid_request_error"}},
+                {},
+            )
+        if top_k_tools < 1:
+            return (
+                400,
+                {"error": {"code": "invalid_header", "message": "x-hypergate-tools-top-k must be >= 1", "type": "invalid_request_error"}},
+                {},
+            )
+
+        requested_model = req_json.get("model", "gpt-4o-mini")
+        if not isinstance(requested_model, str) or not requested_model.strip():
+            requested_model = "gpt-4o-mini"
+        messages = req_json.get("messages", [])
+        if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+            return (
+                400,
+                {"error": {"code": "invalid_request", "message": "'messages' must be a JSON array of message objects", "type": "invalid_request_error"}},
+                {},
+            )
 
         session = self.budget_ledger.get_or_create(trace_id, budget_limit=budget_limit)
-        requested_model = req_json.get("model", "gpt-4o-mini")
-        messages = req_json.get("messages", [])
 
         # 1. System-One Classification
         tier_idx, rationale = self.classifier.classify(messages)
@@ -947,7 +1055,6 @@ class HyperGateRouter:
         tools_pruned_stat = None
         if "tools" in req_json and isinstance(req_json["tools"], list):
             orig_len = len(req_json["tools"])
-            top_k_tools = int(headers.get("x-hypergate-tools-top-k", 8))
             if orig_len > top_k_tools:
                 req_json["tools"] = ToolPruner.prune_tools(
                     req_json["tools"],
@@ -957,7 +1064,7 @@ class HyperGateRouter:
                 tools_pruned_stat = f"{orig_len}->{len(req_json['tools'])}"
 
         # 2. Pre-flight Budget & Kill-Switch Check
-        prompt_text = "".join(m.get("content", "") for m in messages)
+        prompt_text = "".join(_content_text(m) for m in messages)
         est_tokens = self.pricing_engine.estimate_tokens(prompt_text)
         est_cost = self.pricing_engine.calculate_cost(requested_model, est_tokens, est_tokens)
 
@@ -1105,9 +1212,9 @@ class HyperGateRouter:
         return receipt
 
     def _resolve_execution(
-        self, model: str, messages: List[Dict[str, str]], tier: str, prompt_text: str
+        self, model: str, messages: List[Dict[str, Any]], tier: str, prompt_text: str
     ) -> Tuple[Dict[str, Any], int, int]:
-        last_msg = messages[-1].get("content", "") if messages else ""
+        last_msg = _content_text(messages[-1]) if messages else ""
 
         if tier == "TIER_0_CACHE":
             content = f"[HyperGate Cache Hit] {last_msg}"
@@ -1150,7 +1257,19 @@ class HyperGateGatewayHandler(BaseHTTPRequestHandler):
     Injects custom x-hypergate-* headers and strictly halts runaway loops.
     """
     server_version = "HyperGate/0.1.0"
-    router = HyperGateRouter()
+    router: Optional[HyperGateRouter] = None
+    _router_init_lock = threading.RLock()
+
+    def _get_router(self) -> HyperGateRouter:
+        srv_router = getattr(self.server, "router", None)
+        if srv_router is not None:
+            return srv_router
+        if self.router is not None:
+            return self.router
+        with HyperGateGatewayHandler._router_init_lock:
+            if HyperGateGatewayHandler.router is None:
+                HyperGateGatewayHandler.router = HyperGateRouter()
+        return HyperGateGatewayHandler.router
 
     def log_message(self, format, *args):
         pass
@@ -1188,7 +1307,7 @@ class HyperGateGatewayHandler(BaseHTTPRequestHandler):
                 "object": "list",
                 "data": [
                     {"id": m, "object": "model", "owned_by": "hypergate", "tier": info.get("tier", "TIER_2_BALANCED")}
-                    for m, info in self.router.pricing_engine.pricing.items()
+                    for m, info in self._get_router().pricing_engine.pricing.items()
                 ]
             }
             self._send_json(200, models_data)
@@ -1223,8 +1342,12 @@ class HyperGateGatewayHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"Invalid JSON body: {e}"})
             return
 
-        req_headers = dict(self.headers)
-        status, resp_data, out_headers = self.router.handle_chat_completion(req_json, req_headers)
+        req_headers = {str(k).lower(): v for k, v in self.headers.items()}
+        try:
+            status, resp_data, out_headers = self._get_router().handle_chat_completion(req_json, req_headers)
+        except Exception:
+            self._send_json(500, {"error": {"code": "internal_error", "message": "Internal gateway error", "type": "server_error"}})
+            return
         self._send_json(status, resp_data, headers=out_headers)
 
 
@@ -1245,6 +1368,7 @@ class HyperGateServer:
     def start(self, blocking: bool = False):
         HyperGateGatewayHandler.router = self.router
         self._server = ThreadingHTTPServer((self.host, self.port), HyperGateGatewayHandler)
+        self._server.router = self.router
         self._server.auth_token = self.auth_token
         if blocking:
             print(f"⚡ HyperGate Gateway listening on http://{self.host}:{self.port}")
@@ -1332,7 +1456,7 @@ class HyperGateClient:
 
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                resp_headers = dict(resp.headers)
+                resp_headers = {str(k).lower(): v for k, v in resp.headers.items()}
                 self.last_response_headers = resp_headers
                 raw_data = resp.read().decode("utf-8")
                 data = json.loads(raw_data)
@@ -1340,7 +1464,7 @@ class HyperGateClient:
                 return data
         except urllib.error.HTTPError as e:
             raw_err = e.read().decode("utf-8")
-            self.last_response_headers = dict(e.headers)
+            self.last_response_headers = {str(k).lower(): v for k, v in e.headers.items()}
             try:
                 err_json = json.loads(raw_err)
             except Exception:
@@ -1542,7 +1666,7 @@ class ToolPruner:
             for i, m in enumerate(prompt_or_messages):
                 if not isinstance(m, dict):
                     continue
-                content = str(m.get("content", ""))
+                content = _content_text(m)
                 full_context_parts.append(content)
 
                 # Multi-turn rule: most recent user prompt weighted 3x higher than prior turns
@@ -1715,7 +1839,9 @@ class ZeroMCPSupervisor:
         max_turns: int = 30,
         max_retries: int = 3,
         initial_backoff_sec: float = 0.02,
-        backoff_multiplier: float = 2.0
+        backoff_multiplier: float = 2.0,
+        rpc_timeout: float = 15.0,
+        max_frame_bytes: int = 10 * 1024 * 1024,
     ):
         self.server_cmd = server_cmd
         self.trace_id = trace_id or f"mcp_trc_{uuid.uuid4().hex[:12]}"
@@ -1724,12 +1850,59 @@ class ZeroMCPSupervisor:
         self.max_retries = max(0, max_retries)
         self.initial_backoff_sec = initial_backoff_sec
         self.backoff_multiplier = backoff_multiplier
+        self.rpc_timeout = max(0.05, float(rpc_timeout))
+        self.max_frame_bytes = max(1024, int(max_frame_bytes))
         self.turn_count = 0
         self.rolling_cost_usd = 0.0
         self.pricing = PricingEngine()
         self.process: Optional[subprocess.Popen] = None
+        self._stderr_lines: deque = deque(maxlen=64)
+        self._stdout_queue: queue.Queue = queue.Queue()
+        self._stdout_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._wire_req_seq = 0
+
+    def _drain_stderr(self, proc: subprocess.Popen) -> None:
+        pipe = proc.stderr
+        if pipe is None:
+            return
+        try:
+            while True:
+                line = pipe.readline(1024)
+                if not line:
+                    break
+                self._stderr_lines.append(line.rstrip("\r\n")[:512])
+        except Exception:
+            pass
+
+    def _read_stdout(self, proc: subprocess.Popen, out_q: queue.Queue) -> None:
+        pipe = proc.stdout
+        if pipe is None:
+            out_q.put(("EOF", ""))
+            return
+        try:
+            while True:
+                line = pipe.readline(self.max_frame_bytes + 1)
+                if not line:
+                    out_q.put(("EOF", ""))
+                    break
+                if len(line.encode("utf-8", errors="replace")) > self.max_frame_bytes or (
+                    len(line) > self.max_frame_bytes and not line.endswith("\n")
+                ):
+                    if not line.endswith("\n"):
+                        while True:
+                            chunk = pipe.read(65536)
+                            if not chunk or "\n" in chunk:
+                                break
+                    out_q.put(("OVERSIZED", f"Frame exceeded {self.max_frame_bytes} bytes"))
+                    continue
+                out_q.put(("LINE", line))
+        except Exception as exc:
+            out_q.put(("ERR", str(exc)))
 
     def start(self):
+        self._stderr_lines.clear()
+        self._stdout_queue = queue.Queue()
         self.process = subprocess.Popen(
             self.server_cmd,
             stdin=subprocess.PIPE,
@@ -1738,6 +1911,10 @@ class ZeroMCPSupervisor:
             text=True,
             bufsize=1
         )
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, args=(self.process,), daemon=True)
+        self._stdout_thread = threading.Thread(target=self._read_stdout, args=(self.process, self._stdout_queue), daemon=True)
+        self._stderr_thread.start()
+        self._stdout_thread.start()
 
     def send_rpc(
         self,
@@ -1780,9 +1957,18 @@ class ZeroMCPSupervisor:
             if not self.process or self.process.poll() is not None:
                 self.start()
 
+            # Drain any stale buffered frames before dispatching a new RPC
+            while True:
+                try:
+                    self._stdout_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+            self._wire_req_seq += 1
+            wire_id = f"hg-{self._wire_req_seq}"
             rpc_req = {
                 "jsonrpc": "2.0",
-                "id": req_id,
+                "id": wire_id,
                 "method": method,
                 "params": params or {}
             }
@@ -1791,39 +1977,93 @@ class ZeroMCPSupervisor:
                 self.process.stdin.write(raw_req)
                 self.process.stdin.flush()
 
-                raw_resp = self.process.stdout.readline()
-                if not raw_resp:
-                    exit_code = self.process.poll()
-                    err_detail = self.process.stderr.read() if self.process.stderr else ""
-                    last_error_resp = {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32603,
-                            "message": f"ZeroMCP server terminated unexpectedly (exit code {exit_code})",
-                            "data": {
-                                "type": "GATEWAY_ERROR",
-                                "detail": err_detail.strip()[:500],
-                                "retries_attempted": attempt
+                deadline = time.monotonic() + self.rpc_timeout
+                parsed_resp: Optional[Dict[str, Any]] = None
+                raw_resp = ""
+                skipped_frames = 0
+
+                while True:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0 or skipped_frames >= 256:
+                        raise TimeoutError(f"ZeroMCP server timed out waiting for response id={req_id}")
+                    try:
+                        kind, payload = self._stdout_queue.get(timeout=rem)
+                    except queue.Empty:
+                        raise TimeoutError(f"ZeroMCP server timed out waiting for response id={req_id}")
+
+                    if kind == "EOF":
+                        exit_code = self.process.poll()
+                        if exit_code is None:
+                            try:
+                                exit_code = self.process.wait(timeout=0.3)
+                            except Exception:
+                                exit_code = None
+                        if self._stderr_thread is not None:
+                            self._stderr_thread.join(timeout=0.2)
+                        err_detail = "\n".join(self._stderr_lines)
+                        last_error_resp = {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": {
+                                "code": -32603,
+                                "message": f"ZeroMCP server terminated unexpectedly (exit code {exit_code})",
+                                "data": {
+                                    "type": "GATEWAY_ERROR",
+                                    "detail": err_detail.strip()[:500],
+                                    "retries_attempted": attempt
+                                }
                             }
                         }
-                    }
+                        break
+                    if kind == "OVERSIZED":
+                        raise OSError(payload)
+                    if kind == "ERR":
+                        raise OSError(payload)
+
+                    candidate = json.loads(payload.strip())
+                    if not isinstance(candidate, dict):
+                        skipped_frames += 1
+                        continue
+                    # Skip notifications & answer server-initiated requests with -32601
+                    if "method" in candidate:
+                        skipped_frames += 1
+                        est_n = self.pricing.estimate_tokens(payload)
+                        self.rolling_cost_usd += self.pricing.calculate_cost("gpt-4o-mini", est_n, 0)
+                        if "id" in candidate:
+                            try:
+                                rej = json.dumps({
+                                    "jsonrpc": "2.0",
+                                    "id": candidate["id"],
+                                    "error": {"code": -32601, "message": "Method not found"},
+                                }) + "\n"
+                                self.process.stdin.write(rej)
+                                self.process.stdin.flush()
+                            except Exception:
+                                pass
+                        continue
+                    if candidate.get("id") != wire_id:
+                        skipped_frames += 1
+                        continue
+                    raw_resp = payload
+                    parsed_resp = dict(candidate)
+                    parsed_resp["id"] = req_id
+                    break
+
+                if parsed_resp is None:
+                    self.kill()
                     if attempt < self.max_retries:
                         attempt += 1
-                        self.kill()
                         time.sleep(current_backoff)
                         current_backoff *= self.backoff_multiplier
                         continue
                     if normalize_errors:
                         return last_error_resp
-                    raise RuntimeError(f"ZeroMCP server closed stdout unexpectedly (code {exit_code}).")
+                    raise RuntimeError("ZeroMCP server closed stdout unexpectedly.")
 
                 # Estimate turn cost
                 est_tokens = self.pricing.estimate_tokens(raw_req + raw_resp)
                 turn_cost = self.pricing.calculate_cost("gpt-4o-mini", est_tokens, est_tokens)
                 self.rolling_cost_usd += turn_cost
-
-                parsed_resp = json.loads(raw_resp.strip())
 
                 # If upstream server returns -32603 internal error, retry if retries remain
                 if isinstance(parsed_resp, dict) and "error" in parsed_resp:
@@ -1836,13 +2076,14 @@ class ZeroMCPSupervisor:
 
                 return parsed_resp
 
-            except (json.JSONDecodeError, BrokenPipeError, OSError) as e:
+            except (json.JSONDecodeError, BrokenPipeError, OSError, TimeoutError) as e:
+                err_msg = f"ZeroMCP server terminated unexpectedly ({e})" if isinstance(e, BrokenPipeError) else f"ZeroMCP Gateway RPC communication error: {str(e)}"
                 last_error_resp = {
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "error": {
                         "code": -32603,
-                        "message": f"ZeroMCP Gateway RPC communication error: {str(e)}",
+                        "message": err_msg[:400],
                         "data": {
                             "type": "GATEWAY_ERROR",
                             "exception": type(e).__name__,
@@ -1850,9 +2091,9 @@ class ZeroMCPSupervisor:
                         }
                     }
                 }
+                self.kill()
                 if attempt < self.max_retries:
                     attempt += 1
-                    self.kill()
                     time.sleep(current_backoff)
                     current_backoff *= self.backoff_multiplier
                     continue

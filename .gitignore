@@ -4,8 +4,12 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+.hypergate/
+traces/
+*.db
+*.db-wal
+*.db-shm
 dist/
-dist_promoted/
 scratch/
 
 # Internal Development Tooling & Byzantine Review Sentinels

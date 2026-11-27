@@ -3,8 +3,6 @@ target/
 __pycache__/
 .git/
 .DS_Store
-bridges/
-review_consensus_sentinel.py
+.hypergate/
 dist/
-dist_promoted/
 scratch/
